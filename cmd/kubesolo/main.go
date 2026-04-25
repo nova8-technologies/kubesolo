@@ -18,6 +18,7 @@ import (
 	"github.com/portainer/kubesolo/internal/system"
 	"github.com/portainer/kubesolo/pkg/components/coredns"
 	"github.com/portainer/kubesolo/pkg/components/localpath"
+	"github.com/portainer/kubesolo/pkg/components/manifests"
 	"github.com/portainer/kubesolo/pkg/components/portainer"
 	"github.com/portainer/kubesolo/pkg/kine"
 	"github.com/portainer/kubesolo/pkg/kubernetes/apiserver"
@@ -48,6 +49,7 @@ type kubesolo struct {
 	loadBalancer           bool
 	localStorage           bool
 	localStorageSharedPath string
+	manifests              string
 	embedded               types.Embedded
 }
 
@@ -74,6 +76,7 @@ func service() (*kubesolo, error) {
 		loadBalancer:           *flags.LoadBalancer,
 		localStorage:           *flags.LocalStorage,
 		localStorageSharedPath: *flags.LocalStorageSharedPath,
+		manifests:              *flags.Manifests,
 	}, nil
 }
 
@@ -216,6 +219,10 @@ func (s *kubesolo) run() {
 		if err := localpath.Deploy(s.embedded.AdminKubeconfigFile, s.embedded.LocalPathStorageDir, s.localStorageSharedPath); err != nil {
 			log.Fatal().Err(err).Msg("failed to deploy local path")
 		}
+	}
+
+	if err := manifests.Deploy(s.embedded.AdminKubeconfigFile, s.manifests, *flags.Path); err != nil {
+		log.Error().Err(err).Msg("failed to deploy user manifests (non-fatal, continuing)")
 	}
 
 	if s.portainerEdgeID != "" && s.portainerEdgeKey != "" {

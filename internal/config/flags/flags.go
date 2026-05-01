@@ -26,4 +26,5 @@ var (
 	Manifests              = Application.Flag("manifests", "Newline-separated list of manifest URLs or local file paths to apply after API server is ready.").Envar("KUBESOLO_MANIFESTS").Default("").String()
 	Debug                  = Application.Flag("debug", "Enable debug logging. Defaults to false.").Envar("KUBESOLO_DEBUG").Default("false").Bool()
 	PprofServer            = Application.Flag("pprof-server", "Enable pprof server. Defaults to false.").Envar("KUBESOLO_PPROF_SERVER").Default("false").Bool()
+	Full                   = Application.Flag("full", "Disable memory-saving overrides and use upstream Kubernetes defaults. Kubesolo still uses NodeSetter in favour of the scheduler. Recommended for CI and developer environments where memory is not constrained. Leave unset for edge deployments.").Envar("KUBESOLO_FULL").Default("false").Bool()
 )

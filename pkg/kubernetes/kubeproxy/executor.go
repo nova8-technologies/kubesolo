@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/portainer/kubesolo/internal/runtime/network"
 	kubesoloservice "github.com/portainer/kubesolo/internal/runtime/service"
 	"github.com/portainer/kubesolo/types"
 	"github.com/rs/zerolog/log"
@@ -25,6 +26,12 @@ func flushNftablesNat() {
 		return
 	}
 	log.Info().Str("component", "kubeproxy").Msg("flushed nftables ip nat table to avoid iptables-nft conflicts")
+
+	// The flush above wipes CNI masquerade rules for already-running pods.
+	// Re-add immediately so the gap where pods have no SNAT is negligible.
+	if err := network.EnsurePodMasquerade(types.DefaultPodCIDR); err != nil {
+		log.Warn().Str("component", "kubeproxy").Msgf("failed to restore pod masquerade after nat flush: %v", err)
+	}
 }
 
 // Run starts the kube proxy in the following order:
@@ -43,7 +50,12 @@ func (s *service) Run(kubeletReadyCh chan struct{}) error {
 	time.Sleep(types.DefaultComponentSleep)
 	if err := kubesoloservice.RunServiceWithStartupCheck(func() error {
 		<-kubeletReadyCh
-		flushNftablesNat()
+		// Only flush the nat table when using iptables mode. In nftables mode
+		// kube-proxy manages its own table (kube-proxy) and never writes to
+		// table ip nat, so flushing it would wipe CNI masquerade rules.
+		if detectProxyMode() == "iptables" {
+			flushNftablesNat()
+		}
 		s.wg.Go(func() {
 			if err := command.ExecuteContext(s.ctx); err != nil {
 				log.Error().Str("component", "kubeproxy").Msgf("kubeproxy exited with error: %v", err)
@@ -55,7 +67,9 @@ func (s *service) Run(kubeletReadyCh chan struct{}) error {
 	}
 
 	s.wg.Go(func() {
-		s.postSetup()
+		if err := s.postSetup(); err != nil {
+			return
+		}
 		log.Info().Str("component", "kubeproxy").Msg("kubeproxy started successfully...")
 		close(s.kubeproxyReady)
 	})
@@ -70,11 +84,26 @@ func (s *service) Run(kubeletReadyCh chan struct{}) error {
 	return nil
 }
 
-func (s *service) postSetup() {
+func (s *service) postSetup() error {
 	if err := s.checkKubeProxyHealth(); err != nil {
 		log.Error().Str("component", "kubeproxy").Msgf("kubeproxy health check failed: %v...", err)
-		s.terminate()
+		s.cancelShutdown()
+		return err
 	}
+	// Re-verify masquerade is in place. flushNftablesNat may have run before
+	// kube-proxy's own chains were programmed; this ensures kubeproxyReady only
+	// fires once SNAT for pod egress is confirmed.
+	if err := network.EnsurePodMasquerade(types.DefaultPodCIDR); err != nil {
+		log.Error().Str("component", "kubeproxy").Msgf("failed to ensure pod masquerade: %v", err)
+	}
+	return nil
+}
+
+// cancelShutdown cancels the service context. Use from goroutines started with s.wg.Go;
+// terminate() must not be called from those goroutines (it waits on s.wg and deadlocks).
+func (s *service) cancelShutdown() {
+	log.Info().Str("component", "kubeproxy").Msg("canceling kubeproxy...")
+	s.cancel()
 }
 
 func (s *service) terminate() {

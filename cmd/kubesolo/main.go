@@ -50,6 +50,7 @@ type kubesolo struct {
 	localStorage           bool
 	localStorageSharedPath string
 	manifests              string
+	fullMode               bool
 	embedded               types.Embedded
 }
 
@@ -77,7 +78,8 @@ func service() (*kubesolo, error) {
 		localStorage:           *flags.LocalStorage,
 		localStorageSharedPath: *flags.LocalStorageSharedPath,
 		manifests:              *flags.Manifests,
-	}, nil
+		fullMode:               *flags.Full,
+		}, nil
 }
 
 // main is the entry point for the kubesolo application
@@ -117,10 +119,16 @@ func (s *kubesolo) run() {
 		cancel()
 	}()
 
+	profile := "edge"
+	if s.fullMode {
+		profile = "full"
+	}
+
 	log.Info().
 		Str("version", Version).
 		Str("build-date", BuildDate).
 		Str("commit", Commit).
+		Str("profile", profile).
 		Msg("starting kubesolo...")
 
 	log.Info().Str("component", "kubesolo").Msg("ensuring all embedded dependencies are available...")
@@ -134,11 +142,14 @@ func (s *kubesolo) run() {
 	}
 	log.Info().Str("component", "kubesolo").Msg("starting kubesolo services... this may take a few minutes...")
 
-	services := []struct {
+	type service struct {
 		name    string
 		start   func()
 		readyCh chan struct{}
-	}{
+	}
+
+	// infraServices must be fully ready before pod masquerade is set up.
+	infraServices := []service{
 		{
 			name: "containerd",
 			start: func() {
@@ -179,6 +190,10 @@ func (s *kubesolo) run() {
 			},
 			readyCh: controllerReadyCh,
 		},
+	}
+
+	// nodeServices start after masquerade is guaranteed to be in place.
+	nodeServices := []service{
 		{
 			name: "kubelet",
 			start: func() {
@@ -192,7 +207,7 @@ func (s *kubesolo) run() {
 		{
 			name: "kubeproxy",
 			start: func() {
-				kubeproxyService := kubeproxy.NewService(ctx, cancel, kubeproxyReadyCh, s.embedded.AdminKubeconfigFile)
+				kubeproxyService := kubeproxy.NewService(ctx, cancel, kubeproxyReadyCh, s.embedded.AdminKubeconfigFile, s.embedded.FullMode)
 				s.wg.Go(func() {
 					kubeproxyService.Run(kubeletReadyCh)
 				})
@@ -201,7 +216,23 @@ func (s *kubesolo) run() {
 		},
 	}
 
-	for _, svc := range services {
+	for _, svc := range infraServices {
+		log.Info().Str("component", "kubesolo").Msgf("starting %s...", svc.name)
+		svc.start()
+		if !waitForService(ctx, svc.name, svc.readyCh) {
+			return
+		}
+	}
+
+	// Ensure pod→external masquerade (SNAT) is in place before kubelet starts.
+	// kine persists cluster state across reboots, so kubelet will immediately
+	// reconcile existing pods — they must not start into a network with no SNAT.
+	log.Info().Str("component", "kubesolo").Msg("setting up pod masquerade rules...")
+	if err := network.EnsurePodMasquerade(types.DefaultPodCIDR); err != nil {
+		log.Fatal().Err(err).Msg("failed to set up pod masquerade")
+	}
+
+	for _, svc := range nodeServices {
 		log.Info().Str("component", "kubesolo").Msgf("starting %s...", svc.name)
 		svc.start()
 		if !waitForService(ctx, svc.name, svc.readyCh) {
@@ -404,14 +435,15 @@ func (s *kubesolo) bootstrap() {
 		},
 
 		// Containerd paths
-		ContainerdDir:            filepath.Join(basePath, types.DefaultContainerdDir),
-		ContainerdSocketFile:     filepath.Join(basePath, types.DefaultContainerdDir, types.DefaultContainerdSocket),
-		ContainerdBinaryFile:     filepath.Join(basePath, types.DefaultContainerdDir, "containerd"),
-		ContainerdImagesDir:      filepath.Join(basePath, types.DefaultContainerdDir, "images"),
-		ContainerdShimBinaryFile: filepath.Join(basePath, types.DefaultContainerdDir, "containerd-shim-runc-v2"),
-		ContainerdConfigFile:     filepath.Join(basePath, types.DefaultContainerdDir, "config.toml"),
-		ContainerdRootDir:        filepath.Join(basePath, types.DefaultContainerdDir, "root"),
-		ContainerdStateDir:       filepath.Join(basePath, types.DefaultContainerdDir, "state"),
+		ContainerdDir:               filepath.Join(basePath, types.DefaultContainerdDir),
+		ContainerdSocketFile:        filepath.Join(basePath, types.DefaultContainerdDir, types.DefaultContainerdSocket),
+		ContainerdBinaryFile:        filepath.Join(basePath, types.DefaultContainerdDir, "containerd"),
+		ContainerdImagesDir:         filepath.Join(basePath, types.DefaultContainerdDir, "images"),
+		ContainerdShimBinaryFile:    filepath.Join(basePath, types.DefaultContainerdDir, "containerd-shim-runc-v2"),
+		ContainerdConfigFile:        filepath.Join(basePath, types.DefaultContainerdDir, "config.toml"),
+		ContainerdRootDir:           filepath.Join(basePath, types.DefaultContainerdDir, "root"),
+		ContainerdStateDir:          filepath.Join(basePath, types.DefaultContainerdDir, "state"),
+		ContainerdRegistryConfigDir: filepath.Join(basePath, types.DefaultContainerdDir, "registry"),
 
 		// CNI paths
 		ContainerdCNIDir:        filepath.Join(basePath, types.DefaultContainerdDir, "cni"),
@@ -459,5 +491,8 @@ func (s *kubesolo) bootstrap() {
 
 		// Portainer Edge
 		IsPortainerEdge: s.portainerEdgeID != "" && s.portainerEdgeKey != "",
+
+		// Full mode
+		FullMode: s.fullMode,
 	}
 }

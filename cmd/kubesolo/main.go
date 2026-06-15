@@ -51,6 +51,8 @@ type kubesolo struct {
 	localStorageSharedPath string
 	manifests              string
 	fullMode               bool
+	disableIPv6            bool
+	dbWALRepair            bool
 	embedded               types.Embedded
 }
 
@@ -79,7 +81,9 @@ func service() (*kubesolo, error) {
 		localStorageSharedPath: *flags.LocalStorageSharedPath,
 		manifests:              *flags.Manifests,
 		fullMode:               *flags.Full,
-		}, nil
+		disableIPv6:            *flags.DisableIPv6,
+		dbWALRepair:            *flags.DBWALRepair,
+	}, nil
 }
 
 // main is the entry point for the kubesolo application
@@ -93,6 +97,10 @@ func main() {
 	if *flags.Version {
 		log.Info().Str("version", Version).Msg("kubesolo version")
 		os.Exit(0)
+	}
+
+	if *flags.StartupTimeout > 0 {
+		types.DefaultRetryCount = *flags.StartupTimeout / int(types.DefaultComponentSleep.Seconds())
 	}
 
 	service, err := service()
@@ -163,7 +171,7 @@ func (s *kubesolo) run() {
 		{
 			name: "kine",
 			start: func() {
-				kineService := kine.NewService(ctx, cancel, s.embedded.KineDir, kineReadyCh)
+				kineService := kine.NewService(ctx, cancel, s.embedded.KineDir, kineReadyCh, s.dbWALRepair)
 				s.wg.Go(func() {
 					kineService.Run()
 				})
@@ -241,7 +249,7 @@ func (s *kubesolo) run() {
 	}
 
 	log.Info().Str("component", "kubesolo").Msg("deploying coredns...")
-	if err := coredns.Deploy(s.embedded.AdminKubeconfigFile); err != nil {
+	if err := coredns.Deploy(s.embedded.AdminKubeconfigFile, s.embedded.DisableIPv6); err != nil {
 		log.Fatal().Err(err).Msg("failed to deploy coredns")
 	}
 
@@ -310,6 +318,10 @@ func cleanStaleState(basePath string) {
 		if name == "containerd" || name == "containerd-shim-runc-v2" || name == "crun" {
 			continue
 		}
+		// Preserve registry
+		if name == "registry" {
+			continue
+		}
 
 		target := filepath.Join(containerdDir, name)
 		if err := os.RemoveAll(target); err == nil {
@@ -353,6 +365,12 @@ func (s *kubesolo) bootstrap() {
 
 	// Load required kernel modules before any networking setup
 	system.LoadRequiredModules()
+
+	if s.disableIPv6 {
+		if err := network.DisableIPv6Sysctls(); err != nil {
+			log.Warn().Err(err).Msg("failed to disable ipv6 sysctls")
+		}
+	}
 
 	// System Node IP
 	nodeIP, err := network.GetNodeIP()
@@ -494,5 +512,8 @@ func (s *kubesolo) bootstrap() {
 
 		// Full mode
 		FullMode: s.fullMode,
+
+		// IPv6
+		DisableIPv6: s.disableIPv6,
 	}
 }
